@@ -1,106 +1,143 @@
-using System.Globalization;
-using WindSensorApp.Core.Models;
+using System.Text;
 using WindSensorApp.Core.Logging;
+using WindSensorApp.Core.Models;
 
 namespace WindSensorApp.Core.Storage;
 
 public interface IDataStorage
 {
-    Task SaveMeasurementAsync(SensorReading reading);
-    Task<List<SensorReading>> LoadMeasurementsAsync(DateTime startTime, DateTime endTime);
-    Task SaveCalibrationAsync(CalibrationData calibration);
-    Task<List<CalibrationData>> LoadCalibrationAsync();
+    Task WriteReadingAsync(SensorReading reading);
+    Task WriteAggregatedAsync(AggregatedData data);
+    Task<List<SensorReading>> ReadReadingsAsync(DateTime from, DateTime to);
+    Task ExportAsync(string filePath);
 }
 
 public class CsvDataStorage : IDataStorage
 {
     private readonly string _archiveFolder;
-    private readonly string _calibrationFile;
+    private readonly object _lockObject = new();
+    private string? _currentFileName;
+    private StreamWriter? _currentWriter;
 
-    public CsvDataStorage(string archiveFolder)
+    public CsvDataStorage(string archiveFolder = "./data/archives")
     {
         _archiveFolder = archiveFolder;
-        _calibrationFile = Path.Combine(archiveFolder, "calibration.csv");
-
-        if (!Directory.Exists(archiveFolder))
-            Directory.CreateDirectory(archiveFolder);
+        Directory.CreateDirectory(_archiveFolder);
     }
 
-    public async Task SaveMeasurementAsync(SensorReading reading)
+    public async Task WriteReadingAsync(SensorReading reading)
     {
-        try
+        lock (_lockObject)
         {
-            string filename = Path.Combine(_archiveFolder, $"measurements_{DateTime.Now:yyyy-MM-dd}.csv");
-            bool fileExists = File.Exists(filename);
-
-            using (var writer = new StreamWriter(filename, append: true))
+            try
             {
-                if (!fileExists)
+                string fileName = GetFileName(reading.Timestamp);
+                
+                // Якщо файл змінився, закрити старий
+                if (_currentFileName != fileName)
                 {
-                    writer.WriteLine("Timestamp,Sensor_Name,Speed,Speed_Primary,Speed_Corrected,Direction,Temperature,Pressure,Valid");
+                    _currentWriter?.Dispose();
+                    _currentWriter = null;
                 }
 
-                writer.WriteLine(
-                    $"{reading.Timestamp:yyyy-MM-dd HH:mm:ss.fff},{reading.SensorName},{reading.Speed:F4}," +
-                    $"{reading.SpeedPrimary:F4},{reading.SpeedCorrected:F4},{reading.Direction:F2}," +
-                    $"{(reading.Temperature?.ToString("F2") ?? "")},(reading.Pressure?.ToString("F2") ?? "")},{reading.IsValid}"
-                );
-            }
+                // Відкрити файл
+                if (_currentWriter == null)
+                {
+                    string filePath = Path.Combine(_archiveFolder, fileName);
+                    bool fileExists = File.Exists(filePath);
+                    _currentWriter = new StreamWriter(filePath, append: true, encoding: Encoding.UTF8);
+                    _currentFileName = fileName;
 
-            await Task.CompletedTask;
+                    // Записати заголовок якщо новий файл
+                    if (!fileExists)
+                    {
+                        _currentWriter.WriteLine(GetCsvHeader());
+                    }
+                }
+
+                // Записати дані
+                string line = reading.SensorName switch
+                {
+                    "Lufft V200A-UMB" => FormatLufftReading(reading),
+                    "Boeder W16" => FormatBoederReading(reading),
+                    _ => FormatGenericReading(reading)
+                };
+
+                _currentWriter.WriteLine(line);
+                _currentWriter.Flush();
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"CSV write error: {ex.Message}");
+            }
+        }
+
+        await Task.CompletedTask;
+    }
+
+    public async Task WriteAggregatedAsync(AggregatedData data)
+    {
+        string fileName = $"aggregated_{data.Timestamp:yyyy-MM-dd}.csv";
+        string filePath = Path.Combine(_archiveFolder, fileName);
+
+        try
+        {
+            lock (_lockObject)
+            {
+                bool fileExists = File.Exists(filePath);
+                using (var writer = new StreamWriter(filePath, append: true, encoding: Encoding.UTF8))
+                {
+                    if (!fileExists)
+                    {
+                        writer.WriteLine("Timestamp,SensorName,Stats10min_Max,Stats10min_Min,Stats10min_Avg,Stats3hour_Max,Stats3hour_Min,Stats3hour_Avg,Stats24hour_Max,Stats24hour_Min,Stats24hour_Avg");
+                    }
+
+                    writer.WriteLine($"{data.Timestamp:yyyy-MM-dd HH:mm:ss},{data.SensorName}" +
+                        $",{data.Stats10Min.MaxSpeed:F2},{data.Stats10Min.MinSpeed:F2},{data.Stats10Min.AvgSpeed:F2}" +
+                        $",{data.Stats3Hour.MaxSpeed:F2},{data.Stats3Hour.MinSpeed:F2},{data.Stats3Hour.AvgSpeed:F2}" +
+                        $",{data.Stats24Hour.MaxSpeed:F2},{data.Stats24Hour.MinSpeed:F2},{data.Stats24Hour.AvgSpeed:F2}");
+                }
+            }
         }
         catch (Exception ex)
         {
-            Logger.Error($"Error saving measurement: {ex.Message}");
+            Logger.Error($"CSV aggregated write error: {ex.Message}");
         }
+
+        await Task.CompletedTask;
     }
 
-    public async Task<List<SensorReading>> LoadMeasurementsAsync(DateTime startTime, DateTime endTime)
+    public async Task<List<SensorReading>> ReadReadingsAsync(DateTime from, DateTime to)
     {
         var readings = new List<SensorReading>();
 
         try
         {
-            string pattern = "measurements_*.csv";
-            var files = Directory.GetFiles(_archiveFolder, pattern)
-                .Where(f => File.GetCreationTime(f) >= startTime && File.GetCreationTime(f) <= endTime)
-                .ToList();
-
-            foreach (var file in files)
+            for (DateTime date = from.Date; date <= to.Date; date = date.AddDays(1))
             {
-                using (var reader = new StreamReader(file))
+                string fileName = GetFileName(date);
+                string filePath = Path.Combine(_archiveFolder, fileName);
+
+                if (!File.Exists(filePath))
+                    continue;
+
+                using (var reader = new StreamReader(filePath))
                 {
                     string? line;
-                    bool isHeader = true;
+                    bool skipHeader = true;
 
                     while ((line = await reader.ReadLineAsync()) != null)
                     {
-                        if (isHeader)
+                        if (skipHeader)
                         {
-                            isHeader = false;
+                            skipHeader = false;
                             continue;
                         }
 
-                        var parts = line.Split(',');
-                        if (parts.Length >= 7 && DateTime.TryParseExact(
-                            parts[0], "yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture,
-                            System.Globalization.DateTimeStyles.None, out var timestamp))
+                        var reading = ParseCsvLine(line);
+                        if (reading?.Timestamp >= from && reading?.Timestamp <= to)
                         {
-                            if (timestamp >= startTime && timestamp <= endTime)
-                            {
-                                readings.Add(new SensorReading
-                                {
-                                    Timestamp = timestamp,
-                                    SensorName = parts[1],
-                                    Speed = double.Parse(parts[2]),
-                                    SpeedPrimary = double.Parse(parts[3]),
-                                    SpeedCorrected = double.Parse(parts[4]),
-                                    Direction = double.Parse(parts[5]),
-                                    Temperature = parts[6] == "" ? null : double.Parse(parts[6]),
-                                    Pressure = parts[7] == "" ? null : double.Parse(parts[7]),
-                                    IsValid = bool.Parse(parts[8])
-                                });
-                            }
+                            readings.Add(reading);
                         }
                     }
                 }
@@ -108,86 +145,63 @@ public class CsvDataStorage : IDataStorage
         }
         catch (Exception ex)
         {
-            Logger.Error($"Error loading measurements: {ex.Message}");
+            Logger.Error($"CSV read error: {ex.Message}");
         }
 
         return readings;
     }
 
-    public async Task SaveCalibrationAsync(CalibrationData calibration)
+    public async Task ExportAsync(string filePath)
     {
-        try
-        {
-            bool fileExists = File.Exists(_calibrationFile);
-
-            using (var writer = new StreamWriter(_calibrationFile, append: true))
-            {
-                if (!fileExists)
-                {
-                    writer.WriteLine("Timestamp,Direction_Sector,Speed_Range,Coefficient_A,Coefficient_B,R2,RMSE,Data_Points,Valid");
-                }
-
-                writer.WriteLine(
-                    $"{calibration.Timestamp:yyyy-MM-dd HH:mm:ss},{calibration.DirectionSector}," +
-                    $"{calibration.SpeedRange},{calibration.CoefficientA:F6},{calibration.CoefficientB:F6}," +
-                    $"{calibration.R2:F4},{calibration.RMSE:F6},{calibration.DataPointCount},{calibration.IsValid}"
-                );
-            }
-
-            await Task.CompletedTask;
-        }
-        catch (Exception ex)
-        {
-            Logger.Error($"Error saving calibration: {ex.Message}");
-        }
+        Logger.Info($"Exporting data to {filePath}");
+        await Task.CompletedTask;
     }
 
-    public async Task<List<CalibrationData>> LoadCalibrationAsync()
-    {
-        var calibrations = new List<CalibrationData>();
+    private string GetFileName(DateTime dateTime) => $"sensor_data_{dateTime:yyyy-MM-dd}.csv";
 
+    private string GetCsvHeader() =>
+        "Timestamp,SensorName,Speed,SpeedPrimary,SpeedCorrected,Direction,Temperature,Pressure,IsValid,ErrorMessage";
+
+    private string FormatLufftReading(SensorReading reading) =>
+        $"{reading.Timestamp:yyyy-MM-dd HH:mm:ss.fff},{reading.SensorName}" +
+        $",{reading.Speed:F2},,{reading.SpeedCorrected:F2},{reading.Direction:F1}" +
+        $",{reading.Temperature:F2},{reading.Pressure:F2},{reading.IsValid},\"{reading.ErrorMessage}\"";
+
+    private string FormatBoederReading(SensorReading reading) =>
+        $"{reading.Timestamp:yyyy-MM-dd HH:mm:ss.fff},{reading.SensorName}" +
+        $",{reading.Speed:F2},{reading.SpeedPrimary:F2},{reading.SpeedCorrected:F2},{reading.Direction:F1}" +
+        $",,{reading.IsValid},\"{reading.ErrorMessage}\"";
+
+    private string FormatGenericReading(SensorReading reading) =>
+        $"{reading.Timestamp:yyyy-MM-dd HH:mm:ss.fff},{reading.SensorName}" +
+        $",{reading.Speed:F2},,{reading.SpeedCorrected:F2},{reading.Direction:F1}" +
+        $",,{reading.IsValid},\"{reading.ErrorMessage}\"";
+
+    private SensorReading? ParseCsvLine(string line)
+    {
         try
         {
-            if (!File.Exists(_calibrationFile))
-                return calibrations;
+            var parts = line.Split(',');
+            if (parts.Length < 9)
+                return null;
 
-            using (var reader = new StreamReader(_calibrationFile))
+            return new SensorReading
             {
-                string? line;
-                bool isHeader = true;
-
-                while ((line = await reader.ReadLineAsync()) != null)
-                {
-                    if (isHeader)
-                    {
-                        isHeader = false;
-                        continue;
-                    }
-
-                    var parts = line.Split(',');
-                    if (parts.Length >= 9)
-                    {
-                        calibrations.Add(new CalibrationData
-                        {
-                            Timestamp = DateTime.Parse(parts[0]),
-                            DirectionSector = int.Parse(parts[1]),
-                            SpeedRange = int.Parse(parts[2]),
-                            CoefficientA = double.Parse(parts[3]),
-                            CoefficientB = double.Parse(parts[4]),
-                            R2 = double.Parse(parts[5]),
-                            RMSE = double.Parse(parts[6]),
-                            DataPointCount = int.Parse(parts[7]),
-                            IsValid = bool.Parse(parts[8])
-                        });
-                    }
-                }
-            }
+                Timestamp = DateTime.Parse(parts[0]),
+                SensorName = parts[1],
+                Speed = double.Parse(parts[2]),
+                SpeedPrimary = string.IsNullOrEmpty(parts[3]) ? 0 : double.Parse(parts[3]),
+                SpeedCorrected = string.IsNullOrEmpty(parts[4]) ? 0 : double.Parse(parts[4]),
+                Direction = double.Parse(parts[5]),
+                Temperature = string.IsNullOrEmpty(parts[6]) ? null : double.Parse(parts[6]),
+                Pressure = string.IsNullOrEmpty(parts[7]) ? null : double.Parse(parts[7]),
+                IsValid = bool.Parse(parts[8]),
+                ErrorMessage = parts.Length > 9 ? parts[9] : string.Empty
+            };
         }
-        catch (Exception ex)
+        catch
         {
-            Logger.Error($"Error loading calibration: {ex.Message}");
+            return null;
         }
-
-        return calibrations;
     }
 }

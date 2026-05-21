@@ -1,6 +1,5 @@
-using System.Globalization;
-using WindSensorApp.Core.Models;
 using WindSensorApp.Core.Logging;
+using WindSensorApp.Core.Models;
 
 namespace WindSensorApp.Core.Calibration;
 
@@ -10,28 +9,32 @@ public class LinearRegression
     public double CoefficientB { get; set; }
     public double R2 { get; set; }
     public double RMSE { get; set; }
-    public int DataPointCount { get; private set; }
+    public int DataPointCount { get; set; }
 
-    public static LinearRegression? Calculate(List<(double x, double y)> data, bool removeOutliers = true)
+    public static LinearRegression Calculate(List<(double x, double y)> dataPoints, double outlierThresholdSigma = 3.0)
     {
-        if (data.Count < 2)
-            return null;
+        var result = new LinearRegression { DataPointCount = dataPoints.Count };
 
-        var workingData = new List<(double x, double y)>(data);
-
-        // Видалити викиди >3σ
-        if (removeOutliers)
+        if (dataPoints.Count < 2)
         {
-            workingData = RemoveOutliers(workingData, 3.0);
+            Logger.Warning($"Not enough data points for regression: {dataPoints.Count}");
+            return result;
         }
 
-        if (workingData.Count < 2)
-            return null;
+        // Видалення викидів
+        var filteredPoints = RemoveOutliers(dataPoints, outlierThresholdSigma);
 
-        int n = workingData.Count;
+        if (filteredPoints.Count < 2)
+        {
+            Logger.Warning($"Not enough data points after outlier removal: {filteredPoints.Count}");
+            return result;
+        }
+
+        // Розрахунок
+        double n = filteredPoints.Count;
         double sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0, sumY2 = 0;
 
-        foreach (var point in workingData)
+        foreach (var point in filteredPoints)
         {
             sumX += point.x;
             sumY += point.y;
@@ -40,233 +43,208 @@ public class LinearRegression
             sumY2 += point.y * point.y;
         }
 
-        double denominator = n * sumX2 - sumX * sumX;
+        double denominator = (n * sumX2) - (sumX * sumX);
+
         if (Math.Abs(denominator) < 1e-10)
-            return null;
-
-        double a = (n * sumXY - sumX * sumY) / denominator;
-        double b = (sumY - a * sumX) / n;
-
-        // Calculate R²
-        double ssRes = 0, ssTot = 0;
-        double yMean = sumY / n;
-
-        foreach (var point in workingData)
         {
-            double yPred = a * point.x + b;
-            ssRes += (point.y - yPred) * (point.y - yPred);
-            ssTot += (point.y - yMean) * (point.y - yMean);
+            Logger.Warning("Cannot calculate regression: denominator too small");
+            return result;
         }
 
-        double r2 = ssTot == 0 ? 0 : 1 - (ssRes / ssTot);
+        result.CoefficientB = ((n * sumXY) - (sumX * sumY)) / denominator;
+        result.CoefficientA = (sumY - (result.CoefficientB * sumX)) / n;
 
-        // Calculate RMSE
-        double rmse = Math.Sqrt(ssRes / n);
+        // R-squared
+        double meanY = sumY / n;
+        double ssRes = 0, ssTot = 0;
 
-        return new LinearRegression
+        foreach (var point in filteredPoints)
         {
-            CoefficientA = a,
-            CoefficientB = b,
-            R2 = r2,
-            RMSE = rmse,
-            DataPointCount = workingData.Count
-        };
+            double predicted = result.CoefficientA + (result.CoefficientB * point.x);
+            ssRes += Math.Pow(point.y - predicted, 2);
+            ssTot += Math.Pow(point.y - meanY, 2);
+        }
+
+        result.R2 = Math.Abs(ssTot) < 1e-10 ? 0 : 1 - (ssRes / ssTot);
+
+        // RMSE
+        result.RMSE = Math.Sqrt(ssRes / n);
+
+        Logger.Debug($"Linear regression: a={result.CoefficientA:F4}, b={result.CoefficientB:F4}, R²={result.R2:F4}, RMSE={result.RMSE:F4}");
+
+        return result;
     }
 
-    private static List<(double x, double y)> RemoveOutliers(
-        List<(double x, double y)> data, double sigmaThreshold = 3.0)
+    private static List<(double x, double y)> RemoveOutliers(List<(double x, double y)> dataPoints, double thresholdSigma)
     {
-        if (data.Count < 3)
-            return data;
+        if (dataPoints.Count < 3)
+            return new List<(double, double)>(dataPoints);
 
-        // Calculate mean and standard deviation for Y values
-        double mean = data.Average(p => p.y);
-        double variance = data.Average(p => Math.Pow(p.y - mean, 2));
-        double sigma = Math.Sqrt(variance);
+        // Розрахунок середнього та стандартного відхилення
+        double mean = dataPoints.Average(p => p.y);
+        double variance = dataPoints.Average(p => Math.Pow(p.y - mean, 2));
+        double stdDev = Math.Sqrt(variance);
 
-        // Filter outliers
-        return data.Where(p => Math.Abs(p.y - mean) <= sigmaThreshold * sigma).ToList();
+        // Фільтрація
+        var filtered = dataPoints.Where(p => Math.Abs(p.y - mean) <= (thresholdSigma * stdDev)).ToList();
+
+        int removed = dataPoints.Count - filtered.Count;
+        if (removed > 0)
+        {
+            Logger.Debug($"Removed {removed} outliers from {dataPoints.Count} data points");
+        }
+
+        return filtered;
     }
 }
 
 public class CalibrationMatrix
 {
-    private readonly Dictionary<(int direction, int speed), CalibrationData> _coefficients;
-    private readonly CalibrationSettings _settings;
+    public CalibrationData[,] Matrix { get; private set; }
+    public int DirectionSectors { get; private set; }
+    public int SpeedRanges { get; private set; }
+    public double DegreesPerSector { get; private set; }
+    public double MetersPerSecondPerRange { get; private set; }
 
-    public CalibrationMatrix(CalibrationSettings settings)
+    public CalibrationMatrix(int directionSectors = 36, int speedRanges = 36, 
+        double degreesPerSector = 10.0, double metersPerSecondPerRange = 1.0)
     {
-        _settings = settings;
-        _coefficients = new Dictionary<(int, int), CalibrationData>();
-    }
+        DirectionSectors = directionSectors;
+        SpeedRanges = speedRanges;
+        DegreesPerSector = degreesPerSector;
+        MetersPerSecondPerRange = metersPerSecondPerRange;
 
-    public void AddCoefficient(int directionSector, int speedRange, double a, double b, double r2, double rmse, int pointCount)
-    {
-        if (!ValidateSectorAndRange(directionSector, speedRange))
-            return;
-
-        var key = (directionSector, speedRange);
-        _coefficients[key] = new CalibrationData
+        // Ініціалізація матриці
+        Matrix = new CalibrationData[directionSectors, speedRanges];
+        for (int i = 0; i < directionSectors; i++)
         {
-            Timestamp = DateTime.Now,
-            DirectionSector = directionSector,
-            SpeedRange = speedRange,
-            CoefficientA = a,
-            CoefficientB = b,
-            R2 = r2,
-            RMSE = rmse,
-            DataPointCount = pointCount,
-            IsValid = r2 >= 0.5 && pointCount >= _settings.MinDataPointsPerCoefficient
-        };
+            for (int j = 0; j < speedRanges; j++)
+            {
+                Matrix[i, j] = new CalibrationData
+                {
+                    DirectionSector = i,
+                    SpeedRange = j,
+                    CoefficientA = 1.0,
+                    CoefficientB = 0.0,
+                    R2 = 0.0,
+                    RMSE = 0.0,
+                    IsValid = false
+                };
+            }
+        }
     }
 
-    public CalibrationData? GetCoefficient(int directionSector, int speedRange)
+    public int GetDirectionSector(double degrees)
     {
-        if (!ValidateSectorAndRange(directionSector, speedRange))
-            return null;
-
-        _coefficients.TryGetValue((directionSector, speedRange), out var result);
-        return result;
-    }
-
-    public double ApplyCalibration(double boederSpeed, int directionSector, int speedRange)
-    {
-        var coeff = GetCoefficient(directionSector, speedRange);
-        if (coeff == null || !coeff.IsValid)
-            return boederSpeed; // Return uncalibrated if no valid coefficient
-
-        // Apply linear regression: CalibratedSpeed = a * BoederSpeed + b
-        return coeff.CoefficientA * boederSpeed + coeff.CoefficientB;
-    }
-
-    public int GetDirectionSector(double directionDegrees)
-    {
-        directionDegrees = directionDegrees % 360;
-        return (int)(directionDegrees / _settings.DegreesPerSector);
+        // Нормалізація 0-360
+        var normalized = degrees % 360;
+        if (normalized < 0) normalized += 360;
+        
+        return (int)(normalized / DegreesPerSector) % DirectionSectors;
     }
 
     public int GetSpeedRange(double speedMps)
     {
-        return Math.Min((int)(speedMps / _settings.MetersPerSecondPerRange), _settings.WindSpeedRanges - 1);
+        int range = (int)(speedMps / MetersPerSecondPerRange);
+        return Math.Min(range, SpeedRanges - 1);
     }
 
-    private bool ValidateSectorAndRange(int sector, int range)
+    public CalibrationData GetCalibration(double direction, double speed)
     {
-        return sector >= 0 && sector < _settings.WindDirectionSectors &&
-               range >= 0 && range < _settings.WindSpeedRanges;
+        int sectorIdx = GetDirectionSector(direction);
+        int rangeIdx = GetSpeedRange(speed);
+        return Matrix[sectorIdx, rangeIdx];
     }
 
-    public Dictionary<(int, int), CalibrationData> GetAllCoefficients() => _coefficients;
-
-    public int GetCoveragePercentage()
+    public void SetCalibration(int directionSector, int speedRange, CalibrationData calibration)
     {
-        int totalCells = _settings.WindDirectionSectors * _settings.WindSpeedRanges;
-        int filledCells = _coefficients.Count;
-        return (filledCells * 100) / totalCells;
+        if (directionSector >= 0 && directionSector < DirectionSectors &&
+            speedRange >= 0 && speedRange < SpeedRanges)
+        {
+            Matrix[directionSector, speedRange] = calibration;
+        }
     }
 }
 
 public class CalibrationEngine
 {
-    private readonly CalibrationMatrix _calibrationMatrix;
-    private readonly CalibrationSettings _settings;
-    private readonly Dictionary<(int direction, int speed), List<(double boeder, double lufft)>> _rawData;
+    private readonly CalibrationMatrix _matrix;
+    private readonly int _minDataPoints;
+    private readonly Dictionary<string, List<(double lufft, double boeder)>> _calibrationData;
 
-    public CalibrationEngine(CalibrationSettings settings)
+    public CalibrationEngine(CalibrationMatrix matrix, int minDataPoints = 100)
     {
-        _settings = settings;
-        _calibrationMatrix = new CalibrationMatrix(settings);
-        _rawData = new Dictionary<(int, int), List<(double, double)>>();
+        _matrix = matrix;
+        _minDataPoints = minDataPoints;
+        _calibrationData = new Dictionary<string, List<(double, double)>>();
     }
 
-    public void AddCalibrationPoint(double boederSpeed, double lufftSpeed, double directionDegrees)
+    public void AddCalibrationPoint(double direction, double speed, double lufftSpeed, double boederSpeed)
     {
-        int directionSector = _calibrationMatrix.GetDirectionSector(directionDegrees);
-        int speedRange = _calibrationMatrix.GetSpeedRange(boederSpeed);
-
-        var key = (directionSector, speedRange);
-        if (!_rawData.ContainsKey(key))
+        string key = $"{_matrix.GetDirectionSector(direction)}_{_matrix.GetSpeedRange(speed)}";
+        
+        if (!_calibrationData.ContainsKey(key))
         {
-            _rawData[key] = new List<(double, double)>();
+            _calibrationData[key] = new List<(double, double)>();
         }
 
-        _rawData[key].Add((boederSpeed, lufftSpeed));
+        _calibrationData[key].Add((lufftSpeed, boederSpeed));
     }
 
-    public bool CalculateCoefficients(int? directionSectorFilter = null, int? speedRangeFilter = null)
+    public void CalculateCoefficients()
     {
-        int calculatedCount = 0;
-
-        foreach (var kvp in _rawData)
+        foreach (var kvp in _calibrationData)
         {
-            int dirSector = kvp.Key.direction;
-            int spdRange = kvp.Key.speed;
-            var points = kvp.Value;
+            var parts = kvp.Key.Split('_');
+            int directionSector = int.Parse(parts[0]);
+            int speedRange = int.Parse(parts[1]);
+            var dataPoints = kvp.Value.Select(p => (p.lufftSpeed, p.boederSpeed)).ToList();
 
-            // Apply filters if specified
-            if (directionSectorFilter.HasValue && dirSector != directionSectorFilter)
-                continue;
-            if (speedRangeFilter.HasValue && spdRange != speedRangeFilter)
-                continue;
-
-            // Check minimum data points
-            if (points.Count < _settings.MinDataPointsPerCoefficient)
+            if (dataPoints.Count >= _minDataPoints)
             {
-                Logger.Warning($"Not enough data points for sector {dirSector}, range {spdRange}: {points.Count}/{_settings.MinDataPointsPerCoefficient}");
-                continue;
-            }
+                var regression = LinearRegression.Calculate(dataPoints);
 
-            // Calculate linear regression
-            var regression = LinearRegression.Calculate(points, _settings.EnableOutlierDetection);
-            if (regression != null)
-            {
-                _calibrationMatrix.AddCoefficient(
-                    dirSector,
-                    spdRange,
-                    regression.CoefficientA,
-                    regression.CoefficientB,
-                    regression.R2,
-                    regression.RMSE,
-                    regression.DataPointCount
-                );
-                calculatedCount++;
-            }
-        }
-
-        Logger.Info($"Calculated {calculatedCount} calibration coefficients");
-        return calculatedCount > 0;
-    }
-
-    public double ApplyCalibration(double boederSpeed, double directionDegrees)
-    {
-        int directionSector = _calibrationMatrix.GetDirectionSector(directionDegrees);
-        int speedRange = _calibrationMatrix.GetSpeedRange(boederSpeed);
-        return _calibrationMatrix.ApplyCalibration(boederSpeed, directionSector, speedRange);
-    }
-
-    public CalibrationMatrix GetMatrix() => _calibrationMatrix;
-
-    public void ExportToCSV(string filePath)
-    {
-        try
-        {
-            using (var writer = new StreamWriter(filePath))
-            {
-                writer.WriteLine("Direction_Sector,Speed_Range,Coefficient_A,Coefficient_B,R2,RMSE,Data_Points,Valid");
-
-                var coefficients = _calibrationMatrix.GetAllCoefficients();
-                foreach (var coeff in coefficients.Values.OrderBy(c => c.DirectionSector).ThenBy(c => c.SpeedRange))
+                var calibration = new CalibrationData
                 {
-                    writer.WriteLine(
-                        $"{coeff.DirectionSector},{coeff.SpeedRange},{coeff.CoefficientA:F6},{coeff.CoefficientB:F6},{coeff.R2:F4},{coeff.RMSE:F6},{coeff.DataPointCount},{coeff.IsValid}"
-                    );
-                }
+                    DirectionSector = directionSector,
+                    SpeedRange = speedRange,
+                    CoefficientA = regression.CoefficientA,
+                    CoefficientB = regression.CoefficientB,
+                    R2 = regression.R2,
+                    RMSE = regression.RMSE,
+                    DataPointCount = dataPoints.Count,
+                    IsValid = regression.R2 > 0.9 // Валідна якщо R² > 0.9
+                };
+
+                _matrix.SetCalibration(directionSector, speedRange, calibration);
+                Logger.Info($"Calibration updated: {calibration}");
             }
-            Logger.Info($"Calibration data exported to {filePath}");
+            else
+            {
+                Logger.Warning($"Insufficient data for sector {directionSector}, range {speedRange}: {dataPoints.Count}/{_minDataPoints}");
+            }
         }
-        catch (Exception ex)
+    }
+
+    public double ApplyCalibration(double direction, double boederSpeed)
+    {
+        var calibration = _matrix.GetCalibration(direction, boederSpeed);
+
+        if (!calibration.IsValid)
         {
-            Logger.Error($"Error exporting calibration data: {ex.Message}");
+            Logger.Warning($"Using uncalibrated data for direction {direction}, speed {boederSpeed}");
+            return boederSpeed; // Повернути оригінальне значення
         }
+
+        // Формула: Lufft = a + b * Boeder
+        return calibration.CoefficientA + (calibration.CoefficientB * boederSpeed);
+    }
+
+    public CalibrationMatrix GetMatrix() => _matrix;
+
+    public void ClearCalibrationData()
+    {
+        _calibrationData.Clear();
+        Logger.Info("Calibration data cleared");
     }
 }
